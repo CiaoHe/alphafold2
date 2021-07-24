@@ -4,36 +4,35 @@ from inspect import isfunction
 from functools import partial
 from itertools import islice, cycle
 from collections import namedtuple
+from dataclasses import dataclass
 import torch.nn.functional as F
 
 from math import sqrt
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
-import alphafold2_pytorch.constants as constants
 from alphafold2_pytorch.utils import *
-from alphafold2_pytorch.rotary import DepthWiseConv1d, AxialRotaryEmbedding, FixedPositionalEmbedding, apply_rotary_pos_emb
+import alphafold2_pytorch.constants as constants
+from alphafold2_pytorch.mlm import MLM
 
 # structure module
 
-from en_transformer import EnTransformer
 from invariant_point_attention import IPATransformer
 
 # constants
 
-Logits = namedtuple('Logits', ['distance', 'theta', 'phi', 'omega'])
+@dataclass
+class ReturnValues:
+    distance: torch.Tensor = None
+    theta: torch.Tensor = None
+    phi: torch.Tensor = None
+    omega: torch.Tensor = None
+    msa_mlm_loss: torch.Tensor = None
 
 # helpers
 
 def exists(val):
     return val is not None
-
-def maybe(fn):
-    def inner(t, *args, **kwargs):
-        if not exists(t):
-            return None
-        return fn(t, *args, **kwargs)
-    return inner
 
 def default(val, d):
     if exists(val):
@@ -109,25 +108,35 @@ class Attention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, mask = None, rotary_emb = None, attn_bias = None, **kwargs):
-        device, orig_shape, h = x.device, x.shape, self.heads
+    def forward(self, x, mask = None, attn_bias = None, context = None, context_mask = None, tie_dim = None):
+        device, orig_shape, h, has_context = x.device, x.shape, self.heads, exists(context)
 
-        q, k, v = (self.to_q(x), *self.to_kv(x).chunk(2, dim = -1))
+        context = default(context, x)
+
+        q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim = -1))
 
         i, j = q.shape[-2], k.shape[-2]
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
 
-        # rotary relative positional encoding
+        # scale
 
-        if exists(rotary_emb):
-            rot_q, rot_k = cast_tuple(rotary_emb, 2)
-            q = apply_rotary_pos_emb(q, rot_q)
-            k = apply_rotary_pos_emb(k, rot_k)
+        q = q * self.scale
 
         # query / key similarities
 
-        dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        if exists(tie_dim):
+            # as in the paper, for the extra MSAs
+            # they average the queries along the rows of the MSAs
+            # they named this particular module MSAColumnGlobalAttention
+
+            q, k = map(lambda t: rearrange(t, '(b r) ... -> b r ...', r = tie_dim), (q, k))
+            q = q.mean(dim = 1)
+
+            dots = einsum('b h i d, b r h j d -> b r h i j', q, k)
+            dots = rearrange(dots, 'b r ... -> (b r) ...')
+        else:
+            dots = einsum('b h i d, b h j d -> b h i j', q, k)
 
         # add attention bias, if supplied (for pairwise to msa attention communication)
 
@@ -138,8 +147,9 @@ class Attention(nn.Module):
 
         if exists(mask):
             mask = default(mask, lambda: torch.ones(1, i, device = device).bool())
+            context_mask = mask if not has_context else default(context_mask, lambda: torch.ones(1, k.shape[-2], device = device).bool())
             mask_value = -torch.finfo(dots.dtype).max
-            mask = mask[:, None, :, None] * mask[:, None, None, :]
+            mask = mask[:, None, :, None] * context_mask[:, None, None, :]
             dots = dots.masked_fill(~mask, mask_value)
 
         # attention
@@ -158,7 +168,7 @@ class Attention(nn.Module):
         # gating
 
         gates = self.gating(x)
-        out = out * gates            
+        out = out * gates.sigmoid()
 
         # combine to out
 
@@ -174,6 +184,7 @@ class AxialAttention(nn.Module):
         row_attn = True,
         col_attn = True,
         accept_edges = False,
+        global_query_attn = False,
         **kwargs
     ):
         super().__init__()
@@ -182,9 +193,9 @@ class AxialAttention(nn.Module):
         attn_class = SparseAttention if sparse_attn else Attention
 
         self.norm = nn.LayerNorm(dim)
+        self.global_query_attn = global_query_attn
 
-        self.attn_width = attn_class(dim = dim, heads = heads, **kwargs)
-        self.attn_height = attn_class(dim = dim, heads = heads, **kwargs)
+        self.attn = attn_class(dim = dim, heads = heads, **kwargs)
 
         self.edges_to_attn_bias = nn.Sequential(
             nn.Linear(dim, heads, bias = False),
@@ -194,7 +205,9 @@ class AxialAttention(nn.Module):
         self.row_attn = row_attn
         self.col_attn = col_attn
 
-    def forward(self, x, edges = None, mask = None, rotary_emb = None):
+    def forward(self, x, edges = None, mask = None):
+        assert self.row_attn ^ self.col_attn, 'has to be either row or column attention, but not both'
+
         b, h, w, d = x.shape
 
         x = self.norm(x)
@@ -204,13 +217,8 @@ class AxialAttention(nn.Module):
         w_mask = h_mask = None
 
         if exists(mask):
-            mask = mask.reshape(b, h, w)
             w_mask = rearrange(mask, 'b h w -> (b w) h')
             h_mask = rearrange(mask, 'b h w -> (b h) w')
-
-        # axial pos emb
-
-        h_rotary_emb, w_rotary_emb = cast_tuple(rotary_emb, 2)
 
         # calculate attention bias
 
@@ -223,23 +231,25 @@ class AxialAttention(nn.Module):
         out = 0
         axial_attn_count = 0
 
-        if self.row_attn:
+        if self.col_attn:
             w_x = rearrange(x, 'b h w d -> (b w) h d')
             if exists(attn_bias):
                 attn_bias = repeat(attn_bias, 'b h i j -> (b x) h i j', x = w)
 
-            w_out = self.attn_width(w_x, mask = w_mask, rotary_emb = w_rotary_emb, attn_bias = attn_bias)
+            tie_dim = w if self.global_query_attn else None
+            w_out = self.attn(w_x, mask = w_mask, attn_bias = attn_bias, tie_dim = tie_dim)
             w_out = rearrange(w_out, '(b w) h d -> b h w d', h = h, w = w)
 
             out += w_out
             axial_attn_count += 1
 
-        if self.col_attn:
+        if self.row_attn:
             h_x = rearrange(x, 'b h w d -> (b h) w d')
             if exists(attn_bias):
                 attn_bias = repeat(attn_bias, 'b h i j -> (b x) h i j', x = h)
 
-            h_out = self.attn_height(h_x, mask = h_mask, rotary_emb = h_rotary_emb, attn_bias = attn_bias)
+            tie_dim = h if self.global_query_attn else None
+            h_out = self.attn(h_x, mask = h_mask, attn_bias = attn_bias, tie_dim = tie_dim)
             h_out = rearrange(h_out, '(b h) w d -> b h w d', h = h, w = w)
 
             out += h_out
@@ -276,9 +286,9 @@ class TriangleMultiplicativeModule(nn.Module):
             nn.init.constant_(gate.weight, 0.)
             nn.init.constant_(gate.bias, 1.)
 
-        if mix == 'ingoing':
+        if mix == 'outgoing':
             self.mix_einsum_eq = '... i k d, ... j k d -> ... i j d'
-        elif mix == 'outgoing':
+        elif mix == 'ingoing':
             self.mix_einsum_eq = '... k j d, ... k i d -> ... i j d'
 
         self.to_out_norm = nn.LayerNorm(hidden_dim)
@@ -331,7 +341,7 @@ class OuterMean(nn.Module):
         x = self.norm(x)
         left = self.left_proj(x)
         right = self.right_proj(x)
-        outer = rearrange(left, 'b m i d -> b m i () d') + rearrange(right, 'b m j d -> b m () j d')
+        outer = rearrange(left, 'b m i d -> b m i () d') * rearrange(right, 'b m j d -> b m () j d')
         outer = outer.mean(dim = 1)
         return self.proj_out(outer)
 
@@ -342,13 +352,14 @@ class PairwiseAttentionBlock(nn.Module):
         seq_len,
         heads,
         dim_head,
-        dropout
+        dropout = 0.,
+        global_column_attn = False
     ):
         super().__init__()
         self.outer_mean = OuterMean(dim)
 
         self.triangle_attention_ingoing = AxialAttention(dim = dim, heads = heads, dim_head = dim_head, row_attn = True, col_attn = False, accept_edges = True)
-        self.triangle_attention_outgoing = AxialAttention(dim = dim, heads = heads, dim_head = dim_head, row_attn = False, col_attn = True, accept_edges = True)
+        self.triangle_attention_outgoing = AxialAttention(dim = dim, heads = heads, dim_head = dim_head, row_attn = False, col_attn = True, accept_edges = True, global_query_attn = global_column_attn)
         self.triangle_multiply_ingoing = TriangleMultiplicativeModule(dim = dim, mix = 'ingoing')
         self.triangle_multiply_outgoing = TriangleMultiplicativeModule(dim = dim, mix = 'outgoing')
 
@@ -356,8 +367,7 @@ class PairwiseAttentionBlock(nn.Module):
         self,
         x,
         mask = None,
-        msa_repr = None,
-        rotary_emb = None
+        msa_repr = None
     ):
         if exists(msa_repr):
             x = x + self.outer_mean(msa_repr)
@@ -375,24 +385,23 @@ class MsaAttentionBlock(nn.Module):
         seq_len,
         heads,
         dim_head,
-        dropout
+        dropout = 0.
     ):
         super().__init__()
-        self.row_attn = AxialAttention(dim = dim, heads = heads, dim_head = dim_head, row_attn = True, col_attn = False)
-        self.col_attn = AxialAttention(dim = dim, heads = heads, dim_head = dim_head, row_attn = False, col_attn = True, accept_edges = True)
+        self.row_attn = AxialAttention(dim = dim, heads = heads, dim_head = dim_head, row_attn = True, col_attn = False, accept_edges = True)
+        self.col_attn = AxialAttention(dim = dim, heads = heads, dim_head = dim_head, row_attn = False, col_attn = True)
 
     def forward(
         self,
         x,
         mask = None,
-        pairwise_repr = None,
-        rotary_emb = None
+        pairwise_repr = None
     ):
-        x = self.row_attn(x) + x
-        x = self.col_attn(x, edges = pairwise_repr) + x
+        x = self.row_attn(x, mask = mask) + x
+        x = self.col_attn(x, mask = mask, edges = pairwise_repr) + x
         return x
 
-# main class
+# main evoformer class
 
 class Evoformer(nn.Module):
     def __init__(
@@ -404,14 +413,15 @@ class Evoformer(nn.Module):
         heads,
         dim_head,
         attn_dropout,
-        ff_dropout
+        ff_dropout,
+        global_column_attn = False
     ):
         super().__init__()
         self.layers = nn.ModuleList([])
 
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                PairwiseAttentionBlock(dim = dim, seq_len = seq_len, heads = heads, dim_head = dim_head, dropout = attn_dropout),
+                PairwiseAttentionBlock(dim = dim, seq_len = seq_len, heads = heads, dim_head = dim_head, dropout = attn_dropout, global_column_attn = global_column_attn),
                 FeedForward(dim = dim, dropout = ff_dropout),
                 MsaAttentionBlock(dim = dim, seq_len = seq_len, heads = heads, dim_head = dim_head, dropout = attn_dropout),
                 FeedForward(dim = dim, dropout = ff_dropout),
@@ -421,22 +431,18 @@ class Evoformer(nn.Module):
         self,
         x,
         m,
-        seq_shape = None,
-        msa_shape = None,
         mask = None,
-        msa_mask = None,
-        seq_pos_emb = None,
-        msa_pos_emb = None
+        msa_mask = None
     ):
         for attn, ff, msa_attn, msa_ff in self.layers:
             # msa attention and transition
 
-            m = msa_attn(m, mask = msa_mask, pairwise_repr = x, rotary_emb = msa_pos_emb) + m
+            m = msa_attn(m, mask = msa_mask, pairwise_repr = x) + m
             m = msa_ff(m) + m
 
             # pairwise attention and transition
 
-            x = attn(x, mask = mask, rotary_emb = seq_pos_emb) + x
+            x = attn(x, mask = mask) + x
             x = ff(x) + x
 
         return x, m
@@ -450,14 +456,18 @@ class Alphafold2(nn.Module):
         depth = 6,
         heads = 8,
         dim_head = 64,
+        max_rel_dist = 32,
         num_tokens = constants.NUM_AMINO_ACIDS,
         num_embedds = constants.NUM_EMBEDDS_TR,
         max_num_msas = constants.MAX_NUM_MSA,
         max_num_templates = constants.MAX_NUM_TEMPLATES,
+        extra_msa_evoformer_layers = 4,
         attn_dropout = 0.,
         ff_dropout = 0.,
         sparse_self_attn = False,
-        template_attn_depth = 2,
+        templates_dim = 32,
+        templates_embed_layers = 4,
+        templates_angles_feats_dim = 55,
         predict_angles = False,
         symmetrize_omega = False,
         predict_coords = False,                # structure module related keyword arguments below
@@ -466,24 +476,63 @@ class Alphafold2(nn.Module):
         structure_module_depth = 4,
         structure_module_heads = 1,
         structure_module_dim_head = 4,
-        disable_token_embed = False
+        disable_token_embed = False,
+        mlm_mask_prob = 0.15,
+        mlm_random_replace_token_prob = 0.1,
+        mlm_keep_token_same_prob = 0.1,
+        mlm_exclude_token_ids = (0,),
     ):
         super().__init__()
         self.dim = dim
 
         # token embedding
 
-        self.token_emb = nn.Embedding(num_tokens, dim) if not disable_token_embed else Always(0)
+        self.token_emb = nn.Embedding(num_tokens + 1, dim) if not disable_token_embed else Always(0)
+        self.to_pairwise_repr = nn.Linear(dim, dim * 2)
         self.disable_token_embed = disable_token_embed
 
         # positional embedding
 
-        self.self_attn_rotary_emb = FixedPositionalEmbedding(dim_head)
+        self.max_rel_dist = max_rel_dist
+        self.pos_emb = nn.Embedding(max_rel_dist * 2 + 1, dim)
+
+        # extra msa embedding
+
+        self.extra_msa_evoformer = Evoformer(
+            dim = dim,
+            depth = extra_msa_evoformer_layers,
+            seq_len = max_seq_len,
+            heads = heads,
+            dim_head = dim_head,
+            attn_dropout = attn_dropout,
+            ff_dropout = ff_dropout,
+            global_column_attn = True
+        )
 
         # template embedding
 
-        self.template_dist_emb = nn.Embedding(constants.DISTOGRAM_BUCKETS, dim)
-        self.template_num_pos_emb = nn.Embedding(max_num_templates, dim)
+        self.to_template_embed = nn.Linear(templates_dim, dim)
+        self.templates_embed_layers = templates_embed_layers
+
+        self.template_pairwise_embedder = PairwiseAttentionBlock(
+            dim = dim,
+            dim_head = dim_head,
+            heads = heads,
+            seq_len = max_seq_len
+        )
+
+        self.template_pointwise_attn = Attention(
+            dim = dim,
+            dim_head = dim_head,
+            heads = heads,
+            dropout = attn_dropout
+        )
+
+        self.template_angle_mlp = nn.Sequential(
+            nn.Linear(templates_angles_feats_dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim)
+        )
 
         # projection for angles, if needed
 
@@ -498,16 +547,6 @@ class Alphafold2(nn.Module):
         # when predicting the coordinates, whether to return the other logits, distogram (and optionally, angles)
 
         self.return_aux_logits = return_aux_logits
-
-        # template sidechain encoding - only if needed
-
-        self.template_sidechain_emb = EnTransformer(
-            dim = dim,
-            dim_head = dim,
-            heads = 1,
-            neighbors = 32,
-            depth = 4
-        )
 
         # custom embedding projection
 
@@ -527,6 +566,18 @@ class Alphafold2(nn.Module):
             dim_head = dim_head,
             attn_dropout = attn_dropout,
             ff_dropout = ff_dropout
+        )
+
+        # MSA SSL MLM
+
+        self.mlm = MLM(
+            dim = dim,
+            num_tokens = num_tokens,
+            mask_id = num_tokens, # last token of embedding is used for masking
+            mask_prob = mlm_mask_prob,
+            keep_token_same_prob = mlm_keep_token_same_prob,
+            random_replace_token_prob = mlm_random_replace_token_prob,
+            exclude_token_ids = mlm_exclude_token_ids
         )
 
         # calculate distogram logits
@@ -561,17 +612,17 @@ class Alphafold2(nn.Module):
         msa = None,
         mask = None,
         msa_mask = None,
+        extra_msa = None,
+        extra_msa_mask = None,
+        seq_index = None,
         seq_embed = None,
         msa_embed = None,
-        templates_seq = None,
-        templates_dist = None,
+        templates_feats = None,
         templates_mask = None,
-        templates_coors = None,
-        templates_sidechains = None,
+        templates_angles = None,
         embedds = None,
         return_trunk = False,
-        return_confidence = False,
-        refine = True
+        return_confidence = False        
     ):
         assert not (self.disable_token_embed and not exists(seq_embed)), 'sequence embedding must be supplied if one has disabled token embedding'
         assert not (self.disable_token_embed and not exists(msa_embed)), 'msa embedding must be supplied if one has disabled token embedding'
@@ -603,142 +654,154 @@ class Alphafold2(nn.Module):
         if exists(seq_embed):
             x += seq_embed
 
-        # outer sum
+        # mlm for MSAs
 
-        x = rearrange(x, 'b i d -> b i () d') + rearrange(x, 'b j d-> b () j d') # create pair-wise residue embeds
-        x_mask = rearrange(mask, 'b i -> b i ()') + rearrange(mask, 'b j -> b () j') if exists(mask) else None
+        if self.training and exists(msa):
+            original_msa = msa
+            msa_mask = default(msa_mask, lambda: torch.ones_like(msa).bool())
+
+            noised_msa, replaced_msa_mask = self.mlm.noise(msa, msa_mask)
+            msa = noised_msa
 
         # embed multiple sequence alignment (msa)
 
-        m = None
-        msa_shape = None
         if exists(msa):
             m = self.token_emb(msa)
 
             if exists(msa_embed):
-                m += msa_embed
+                m = m + msa_embed
 
-            msa_shape = m.shape
+            # add single representation to msa representation
+
+            m = m + rearrange(x, 'b n d -> b () n d')
 
             # get msa_mask to all ones if none was passed
-            msa_mask = default(msa_mask, torch.ones_like(msa).bool())
+            msa_mask = default(msa_mask, lambda: torch.ones_like(msa).bool())
 
         elif exists(embedds):
             m = self.embedd_project(embedds)
-
-            msa_shape = m.shape
             
             # get msa_mask to all ones if none was passed
-            msa_mask = default(msa_mask, torch.ones_like(embedds[..., -1]).bool())
+            msa_mask = default(msa_mask, lambda: torch.ones_like(embedds[..., -1]).bool())
+        else:
+            raise Error('either MSA or embeds must be given')
+
+        # derive pairwise representation
+
+        x_left, x_right = self.to_pairwise_repr(x).chunk(2, dim = -1)
+        x = rearrange(x_left, 'b i d -> b i () d') + rearrange(x_right, 'b j d-> b () j d') # create pair-wise residue embeds
+        x_mask = rearrange(mask, 'b i -> b i ()') + rearrange(mask, 'b j -> b () j') if exists(mask) else None
+
+        # add relative positional embedding
+
+        seq_index = default(seq_index, lambda: torch.arange(n, device = device))
+        seq_rel_dist = rearrange(seq_index, 'i -> () i ()') - rearrange(seq_index, 'j -> () () j')
+        seq_rel_dist = seq_rel_dist.clamp(-self.max_rel_dist, self.max_rel_dist) + self.max_rel_dist
+        rel_pos_emb = self.pos_emb(seq_rel_dist)
 
         # embed templates, if present
 
-        if exists(templates_seq):
-            assert exists(templates_coors), 'template residue coordinates must be supplied `templates_coors`'
-            _, num_templates, *_ = templates_seq.shape
-
-
-            if not exists(templates_dist):
-                templates_dist = get_bucketed_distance_matrix(templates_coors, templates_mask, constants.DISTOGRAM_BUCKETS)
+        if exists(templates_feats):
+            _, num_templates, *_ = templates_feats.shape
 
             # embed template
 
-            t_seq = self.token_emb(templates_seq)
+            t = self.to_template_embed(templates_feats)
+            t_mask_crossed = rearrange(templates_mask, 'b t i -> b t i ()') * rearrange(templates_mask, 'b t j -> b t () j')
 
-            # if sidechain information is present
-            # color the residue embeddings with the sidechain type 1 features
-            # todo (make efficient)
+            t = rearrange(t, 'b t ... -> (b t) ...')
+            t_mask_crossed = rearrange(t_mask_crossed, 'b t ... -> (b t) ...')
 
-            if exists(templates_sidechains):
-                shape = t_seq.shape
-                t_seq = rearrange(t_seq, 'b t n d -> (b t) n d')
-                templates_coors = rearrange(templates_coors, 'b t n c -> (b t) n c')
-                en_mask = rearrange(templates_mask, 'b t n -> (b t) n')
+            for _ in range(self.templates_embed_layers):
+                t = self.template_pairwise_embedder(t, mask = t_mask_crossed) + t
 
-                t_seq, _ = self.template_sidechain_emb(
-                    t_seq,
-                    templates_coors,
-                    mask = en_mask
-                )
-
-                t_seq = t_seq.reshape(*shape)
-
-            # embed template distances
-
-            t_dist = self.template_dist_emb(templates_dist)
-
-            t_seq = rearrange(t_seq, 'b t i d -> b t i () d') + rearrange(t_seq, 'b t j d -> b t () j d')
-            t = t_seq + t_dist
+            t = rearrange(t, '(b t) ... -> b t ...', t = num_templates)
+            t_mask_crossed = rearrange(t_mask_crossed, '(b t) ... -> b t ...', t = num_templates)
 
             # template pos emb
 
-            template_num_pos_emb = self.template_num_pos_emb(torch.arange(num_templates, device = device))
-            t += rearrange(template_num_pos_emb, 't d-> () t () () d')
+            x_point = rearrange(x, 'b i j d -> (b i j) () d')
+            t_point = rearrange(t, 'b t i j d -> (b i j) t d')
+            x_mask_point = rearrange(x_mask, 'b i j -> (b i j) ()')
+            t_mask_point = rearrange(t_mask_crossed, 'b t i j -> (b i j) t')
 
-            assert t.shape[-2:] == x.shape[-2:]
-            x = x + t.mean(dim = 1)
+            template_pooled = self.template_pointwise_attn(
+                x_point,
+                context = t_point,
+                mask = x_mask_point,
+                context_mask = t_mask_point
+            )
 
-        # flatten
+            template_pooled_mask = rearrange(t_mask_point.sum(dim = -1) > 0, 'b -> b () ()')
+            template_pooled = template_pooled * template_pooled_mask
 
-        seq_shape = x.shape
+            template_pooled = rearrange(template_pooled, '(b i j) () d -> b i j d', i = n, j = n)
+            x = x + template_pooled
 
-        # pos emb
+        # add template angle features to MSAs by passing through MLP and then concat
 
-        seq_pos_emb = self.self_attn_rotary_emb(n, device = device)
+        if exists(templates_angles):
+            t_angle_feats = self.template_angle_mlp(templates_angles)
+            m = torch.cat((m, t_angle_feats), dim = 1)
+            msa_mask = torch.cat((msa_mask, templates_mask), dim = 1)
 
-        msa_pos_emb = None
-        seq_to_msa_pos_emb = None
-        msa_to_seq_pos_emb = None
+        # embed extra msa, if present
 
-        if exists(msa):
-            num_msa = msa_shape[-3]
-            msa_seq_len = msa_shape[-2]
+        if exists(extra_msa):
+            extra_m = self.token_emb(msa)
+            extra_msa_mask = default(extra_msa_mask, torch.ones_like(extra_m).bool())
 
-            msa_pos_emb = self.self_attn_rotary_emb(msa_seq_len, device = device)
+            x, extra_m = self.extra_msa_evoformer(
+                x,
+                extra_m,
+                mask = x_mask,
+                msa_mask = extra_msa_mask
+            )
 
         # trunk
 
         x, m = self.net(
             x,
             m,
-            seq_shape,
-            msa_shape,
             mask = x_mask,
-            msa_mask = msa_mask,
-            seq_pos_emb = seq_pos_emb,
-            msa_pos_emb = (msa_pos_emb, None),
+            msa_mask = msa_mask
         )
 
-        # remove templates, if present
+        # ready output container
 
-        x = x.view(seq_shape)
+        ret = ReturnValues()
 
         # calculate theta and phi before symmetrization
 
         if self.predict_angles:
-            theta_logits = self.to_prob_theta(x)
-            phi_logits = self.to_prob_phi(x)
+            ret.theta_logits = self.to_prob_theta(x)
+            ret.phi_logits = self.to_prob_phi(x)
 
         # embeds to distogram
 
         trunk_embeds = (x + rearrange(x, 'b i j d -> b j i d')) * 0.5  # symmetrize
         distance_pred = self.to_distogram_logits(trunk_embeds)
+        ret.distance = distance_pred
+
+        # calculate mlm loss, if training
+
+        msa_mlm_loss = None
+        if self.training and exists(msa):
+            num_msa = original_msa.shape[1]
+            msa_mlm_loss = self.mlm(m[:, :num_msa], original_msa, replaced_msa_mask)
 
         # determine angles, if specified
 
-        ret = distance_pred
-
         if self.predict_angles:
             omega_input = trunk_embeds if self.symmetrize_omega else x
-            omega_logits = self.to_prob_omega(omega_input)
-            ret = Logits(distance_pred, theta_logits, phi_logits, omega_logits)
+            ret.omega_logits = self.to_prob_omega(omega_input)
 
         if not self.predict_coords or return_trunk:
             return ret
 
         # derive single and pairwise embeddings for structural refinement
 
-        m = m.reshape(msa_shape).mean(dim = 1)
+        m = m.mean(dim = 1)
 
         single_repr = self.msa_to_single_repr_dim(m)
         pairwise_repr = self.trunk_to_pairwise_repr_dim(x)

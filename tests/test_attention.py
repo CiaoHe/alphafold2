@@ -57,7 +57,7 @@ def test_anglegrams():
     mask = torch.ones_like(seq).bool()
     msa_mask = torch.ones_like(msa).bool()
 
-    distogram, theta, phi, omega = model(
+    ret = model(
         seq,
         msa,
         mask = mask,
@@ -65,12 +65,14 @@ def test_anglegrams():
     )
     assert True
 
-def test_templates_en():
+def test_templates():
     model = Alphafold2(
         dim = 32,
         depth = 2,
         heads = 2,
-        dim_head = 32
+        dim_head = 32,
+        templates_dim = 32,
+        templates_angles_feats_dim = 32
     )
 
     seq = torch.randint(0, 21, (2, 16))
@@ -79,18 +81,47 @@ def test_templates_en():
     msa = torch.randint(0, 21, (2, 5, 16))
     msa_mask = torch.ones_like(msa).bool()
 
-    templates_seq = torch.randint(0, 21, (2, 2, 16))
-    templates_coors = torch.randn(2, 2, 16, 3)
-    templates_mask = torch.ones_like(templates_seq).bool()
+    templates_feats = torch.randn(2, 3, 16, 16, 32)
+    templates_angles = torch.randn(2, 3, 16, 32)
+    templates_mask = torch.ones(2, 3, 16).bool()
 
     distogram = model(
         seq,
         msa,
         mask = mask,
         msa_mask = msa_mask,
-        templates_seq = templates_seq,
-        templates_coors = templates_coors,
+        templates_feats = templates_feats,
+        templates_angles = templates_angles,
         templates_mask = templates_mask
+    )
+    assert True
+
+def test_extra_msa():
+    model = Alphafold2(
+        dim = 128,
+        depth = 2,
+        heads = 2,
+        dim_head = 32,
+        predict_coords = True,
+        structure_module_dim = 4,
+    )
+
+    seq = torch.randint(0, 21, (2, 4))
+    mask = torch.ones_like(seq).bool()
+
+    msa = torch.randint(0, 21, (2, 5, 4))
+    msa_mask = torch.ones_like(msa).bool()
+
+    extra_msa = torch.randint(0, 21, (2, 5, 4))
+    extra_msa_mask = torch.ones_like(extra_msa).bool()
+
+    coords = model(
+        seq,
+        msa,
+        mask = mask,
+        msa_mask = msa_mask,
+        extra_msa = extra_msa,
+        extra_msa_mask = extra_msa_mask
     )
     assert True
 
