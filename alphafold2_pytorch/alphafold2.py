@@ -704,6 +704,8 @@ class Alphafold2(nn.Module):
         seq_rel_dist = seq_rel_dist.clamp(-self.max_rel_dist, self.max_rel_dist) + self.max_rel_dist
         rel_pos_emb = self.pos_emb(seq_rel_dist)
 
+        x = x + rel_pos_emb
+
         # add recyclables, if present
 
         if exists(recyclables):
@@ -840,7 +842,10 @@ class Alphafold2(nn.Module):
             # go through the layers and apply invariant point attention and feedforward
 
             for _ in range(self.structure_module_depth):
-                rotations = quaternion_to_matrix(quaternions)
+
+                # the detach comes from
+                # https://github.com/deepmind/alphafold/blob/0bab1bf84d9d887aba5cfb6d09af1e8c3ecbc408/alphafold/model/folding.py#L383
+                rotations = quaternion_to_matrix(quaternions).detach()
 
                 single_repr = self.ipa_block(
                     single_repr,
